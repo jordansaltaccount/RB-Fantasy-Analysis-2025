@@ -1,0 +1,227 @@
+---
+title: "2025 RB Fantasy Consistency Analysis"
+subtitle: "Derrick Henry vs. James Cook II vs. Jonathan Taylor"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = FALSE,
+	message = FALSE,
+	warning = FALSE
+)
+
+# Set the graphical theme
+ggplot2::theme_set(ggplot2::theme_light())
+
+
+pacman::p_load(
+  tidyverse,
+  readxl,
+  knitr,
+  ggrepel,
+  scales
+)
+
+```
+
+# 0. Load and prepare the data
+
+The game log has one row per player per game. There is no week column, so `game` below is simply the row order within each player (assumed chronological), and it is **not** the NFL week number because bye weeks are skipped.
+
+```{r load-data}
+# Put the .xlsx in the same folder as this .Rmd (or edit the path)
+data_path <- "RB_Fantasy_Game_Log_v2.xlsx"
+
+rb <- read_excel(data_path) %>%
+  mutate(Name = factor(Name, levels = unique(Name))) %>%   # keep file order
+  group_by(Name) %>%
+  mutate(
+    game           = row_number(),           # game number within the season
+    player_mean    = mean(FPTS),
+    diff_from_mean = FPTS - player_mean
+  ) %>%
+  ungroup()
+
+# Quick sanity checks: 17 games each, no missing values
+rb %>% count(Name, name = "games") %>% kable()
+cat("Missing values:", sum(is.na(rb)), "\n")
+```
+
+```{r theme-colors}
+# One colour per player, reused in every plot
+player_colors <- setNames(hcl.colors(length(rb), "Dark 3"), rb)
+
+theme_set(
+  theme_minimal(base_size = 13) +
+    theme(
+      legend.position = "none",
+      plot.title      = element_text(face = "bold"),
+      plot.subtitle   = element_text(colour = "grey35")
+    )
+)
+```
+
+---
+
+# 1. Who has the largest and smallest standard deviation in fantasy points per game?
+
+## 1a. Variance table
+
+Variance is in squared fantasy points, so standard deviation (SD) is easier to read. I also include the **coefficient of variation (CV = SD / mean)** because a player who scores more will tend to have a bigger raw spread, and CV puts everyone on a relative scale.
+
+```{r variance-table}
+variance_tbl <- rb %>%
+  group_by(Name) %>%
+  summarise(
+    games    = n(),
+    mean     = mean(FPTS),
+    median   = median(FPTS),
+    variance = var(FPTS),
+    sd       = sd(FPTS),
+    cv       = sd / mean,
+    min      = min(FPTS),
+    max      = max(FPTS),
+    iqr      = IQR(FPTS),
+    .groups  = "drop"
+  ) %>%
+  arrange(desc(cv))
+
+variance_tbl %>%
+  kable(digits = 2, caption = "Fantasy points per game, sorted by cv")
+
+most_var  <- as.character(variance_tbl$Name[1])
+least_var <- as.character(variance_tbl$Name[nrow(variance_tbl)])
+cv_high   <- as.character(variance_tbl$Name[which.max(variance_tbl$cv)])
+```
+
+
+## 1b. Spread of weekly scores
+
+```{r variance-boxplot}
+rb %>%
+  mutate(Name = fct_reorder(Name, FPTS, .fun = var)) %>%  # widest spread at the top
+  ggplot(aes(FPTS, Name, colour = Name, fill = Name)) +
+  geom_boxplot(alpha = 0.15, outlier.shape = NA, width = 0.5) +
+  geom_jitter(height = 0.12, width = 0, size = 2.5, alpha = 0.85) +
+  scale_colour_manual(values = player_colors) +
+  scale_fill_manual(values = player_colors) +
+  labs(
+    title    = "Distribution of weekly fantasy points",
+    subtitle = "Ordered from largest to smallest variance; each dot is one game",
+    x = "Fantasy points", y = NULL
+  ) +
+  theme(legend.position = "none")
+```
+
+## 1c. Game-by-game volatility
+
+The dashed line is each player's season mean and the shaded band is ±1 SD. A wider band means a less predictable player.
+
+```{r game-by-game, fig.height=7.5}
+ggplot(rb, aes(game, FPTS, colour = Name)) +
+  geom_rect(
+    data = variance_tbl,
+    aes(xmin = -Inf, xmax = Inf, ymin = mean - sd, ymax = mean + sd, fill = Name),
+    inherit.aes = FALSE, alpha = 0.12
+  ) +
+  geom_hline(data = variance_tbl, aes(yintercept = mean, colour = Name),
+             linetype = "dashed") +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 2.2) +
+  facet_wrap(~Name, ncol = 1) +
+  scale_colour_manual(values = player_colors) +
+  scale_fill_manual(values = player_colors) +
+  scale_x_continuous(breaks = seq(1, max(rb$game), by = 2)) +
+  labs(
+    title    = "Game-by-game fantasy points",
+    subtitle = "Dashed line = season mean; shaded band = mean +/- 1 SD",
+    x = "Game of the season", y = "Fantasy points"
+  )
+```
+
+---
+
+# 2. Which teams does each player perform worst against?
+
+Two views: (1) each player's **lowest single games**, and (2) each player's **average against each opponent** (some opponents were faced twice, so those are averaged). Keep in mind that each opponent was only faced once or twice, so this is a small sample and is affected by game script, injuries, and weather as much as by the defense.
+
+## 2a. Three worst games per player
+
+```{r worst-games}
+worst_games <- rb %>%
+  group_by(Name) %>%
+  slice_min(FPTS, n = 3, with_ties = FALSE) %>%
+  arrange(Name, FPTS) %>%
+  ungroup() %>%
+  transmute(
+    Player        = Name,
+    Opponent      = OPP,
+    `Game #`      = game,
+    FPTS,
+    `Rush att`    = RUSH_ATT,
+    `Rush yds`    = RUSH_YDS,
+    Rec           = REC,
+    `Rec yds`     = REC_YDS,
+    TDs           = RUSH_TD + REC_TD,
+    `Fum lost`    = LOST,
+  )
+
+kable(worst_games, digits = 1, caption = "Three lowest-scoring games for each player")
+```
+
+## 2b. Average fantasy points by opponent
+
+```{r by-opponent}
+by_opp <- rb %>%
+  group_by(Name, OPP) %>%
+  summarise(
+    games    = n(),
+    avg_fpts = mean(FPTS),
+    worst    = min(FPTS),
+    .groups  = "drop"
+  ) %>%
+  group_by(Name) %>%
+  mutate(
+    is_worst3 = rank(avg_fpts, ties.method = "first") <= 3,   # 3 lowest averages
+    opp_label = if_else(games > 1, paste0(OPP, " (", games, " games)"), OPP),
+    # key that lets each facet have its own sort order
+    opp_key   = factor(paste(opp_label, Name, sep = "___"))
+  ) %>%
+  ungroup() %>%
+  mutate(opp_key = fct_reorder(opp_key, avg_fpts))
+
+by_opp %>%
+  filter(is_worst3) %>%
+  arrange(Name, avg_fpts) %>%
+  select(Player = Name, Opponent = OPP, Games = games,
+         `Avg FPTS` = avg_fpts, `Worst game` = worst) %>%
+  kable(digits = 1, caption = "Three lowest opponent averages for each player")
+```
+
+```{r by-opponent-plot, fig.width=12, fig.height=6.5}
+ggplot(by_opp, aes(avg_fpts, opp_key, fill = is_worst3)) +
+  geom_col(width = 0.75) +
+  geom_text(aes(label = sprintf("%.1f", avg_fpts)), hjust = -0.15, size = 3.3) +
+  geom_vline(
+    data = distinct(rb, Name, player_mean),
+    aes(xintercept = player_mean), linetype = "dashed", colour = "grey30"
+  ) +
+  facet_wrap(~Name, scales = "free_y", ncol = 3) +
+  scale_y_discrete(labels = function(x) sub("___.*$", "", x)) +   # strip the helper suffix
+  scale_x_continuous(expand = expansion(mult = c(0, 0.15))) +
+  scale_fill_manual(values = c(`TRUE` = "#C0392B", `FALSE` = "grey70")) +
+  labs(
+    title    = "Average fantasy points by opponent",
+    subtitle = "Red = three lowest opponents for that player; dashed line = player's season average",
+    x = "Average fantasy points", y = NULL
+  )
+```
+
+
+
